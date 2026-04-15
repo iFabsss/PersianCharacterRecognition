@@ -1,17 +1,25 @@
 import os
+import shutil
 
 # CHANGE THIS to your parent folder path
-parent_folder = "PersianAlphabetDataset"
+persian_folder = "PersianAlphabetDataset"
+dataset_folder = "dataset"
+images_folder = "dataset/images"
+labels_folder = "dataset/labels"
+
+# Ensure dataset folders exist
+os.makedirs(images_folder, exist_ok=True)
+os.makedirs(labels_folder, exist_ok=True)
 
 # File to store all unique characters
-character_list_file = os.path.join(parent_folder, "Persian Characters List.txt")
+character_list_file = os.path.join(dataset_folder, "Persian Characters List.txt")
 
 # Store characters
 characters = []
 
 # Loop through each character folder
-for folder_name in os.listdir(parent_folder):
-    folder_path = os.path.join(parent_folder, folder_name)
+for folder_name in os.listdir(persian_folder):
+    folder_path = os.path.join(persian_folder, folder_name)
 
     if os.path.isdir(folder_path):
         # Extract character name (after "-")
@@ -30,16 +38,21 @@ for folder_name in os.listdir(parent_folder):
         # Loop through image files
         for file_name in os.listdir(folder_path):
             if file_name.lower().endswith(".jpg"):
-                image_path = os.path.join(folder_path, file_name)
+                src_image_path = os.path.join(folder_path, file_name)
+                dst_image_path = os.path.join(images_folder, file_name)
+
+                # Copy image to image folder in dataset folder
+                shutil.copy2(src_image_path, dst_image_path)
 
                 # Create corresponding .txt filename
                 txt_name = os.path.splitext(file_name)[0] + ".txt"
-                txt_path = os.path.join(folder_path, txt_name)
+                txt_path = os.path.join(labels_folder, txt_name)
 
                 # Write character name into text file
                 with open(txt_path, "w", encoding="utf-8") as f:
                     f.write(character_text)
 
+                print(f"Copied: {dst_image_path}")
                 print(f"Created: {txt_path}")
 
 # Remove duplicates and sort

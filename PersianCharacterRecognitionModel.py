@@ -12,7 +12,7 @@ Supported layouts:
 
 Usage:
   # Train
-  PersianCharacterRecognitionModel.py --data_dir ./dataset --epochs 30 --batch_size 32
+  PersianCharacterRecognitionModel.py --data_dir ./dataset_copy --epochs 30 --batch_size 32
 
   # Predict
   PersianCharacterRecognitionModel.py --predict path/to/image.jpg \
@@ -56,7 +56,7 @@ set_seed(SEED)
 # 2. CHARACTER VOCABULARY
 #    Built dynamically from .txt label files.
 #    No static Persian↔English map — everything
-#    is derived from the actual dataset labels.
+#    is derived from the actual dataset_copy labels.
 # ─────────────────────────────────────────────
 
 class CharVocab:
@@ -518,7 +518,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # paths
-    p.add_argument("--data_dir",   type=str, default="./dataset",
+    p.add_argument("--data_dir",   type=str, default="./dataset_copy",
                    help="Root directory containing image+label pairs.")
     p.add_argument("--output_dir", type=str, default="./output",
                    help="Where to save checkpoints, vocab JSON, and training log.")
@@ -575,7 +575,7 @@ def main() -> None:
             )
         vocab.load(vocab_save_path)
     else:
-        # Training mode — discover dataset + build vocab from scratch
+        # Training mode — discover dataset_copy + build vocab from scratch
         all_pairs = discover_pairs(args.data_dir)
         vocab.build_from_label_files([p[1] for p in all_pairs])
         vocab.save(vocab_save_path)
