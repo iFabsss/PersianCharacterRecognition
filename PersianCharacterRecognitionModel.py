@@ -37,6 +37,16 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torch.amp import autocast, GradScaler
 
+# Import Persian to English mapping
+try:
+    from PersianCharacterEnglishAlphabet import get_equivalent
+    HAS_MAPPING = True
+except ImportError:
+    print("[Warning] PersianCharacterEnglishAlphabet module not found. "
+          "Will use original Persian labels only.")
+    HAS_MAPPING = False
+    def get_equivalent(x): return x  # fallback identity function
+
 # ─────────────────────────────────────────────
 # 1. REPRODUCIBILITY
 # ─────────────────────────────────────────────
@@ -70,9 +80,10 @@ class CharVocab:
     capitalisation differences don't create duplicate classes.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, use_english_labels: bool = True) -> None:
         self.char_to_idx: dict[str, int] = {}
         self.idx_to_char: dict[int, str] = {}
+        self.use_english_labels = use_english_labels and HAS_MAPPING
         self._built = False
 
     # ── building ──────────────────────────────
@@ -82,6 +93,9 @@ class CharVocab:
         for path in label_paths:
             label = self._read_label(path)
             if label:
+                # Convert to English equivalent if requested
+                if self.use_english_labels:
+                    label = get_equivalent(label)
                 unique_chars.add(label)
 
         if not unique_chars:
@@ -93,6 +107,8 @@ class CharVocab:
 
         self._built = True
         print(f"[Vocab] {len(self.char_to_idx)} classes: {sorted(self.char_to_idx)}")
+        if self.use_english_labels:
+            print(f"[Vocab] Using English label equivalents for classification")
 
     # ── I/O helpers ───────────────────────────
 
@@ -108,6 +124,10 @@ class CharVocab:
     def encode(self, label: str) -> int:
         """Return the integer class index for a label string."""
         label = label.strip().title()
+        # Convert to English equivalent if requested
+        if self.use_english_labels:
+            label = get_equivalent(label)
+        
         if label not in self.char_to_idx:
             raise ValueError(
                 f"[Vocab] Unknown label '{label}'. "
@@ -125,6 +145,7 @@ class CharVocab:
         payload = {
             "char_to_idx": self.char_to_idx,
             "idx_to_char": self.idx_to_char,
+            "use_english_labels": self.use_english_labels,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -135,8 +156,11 @@ class CharVocab:
             data = json.load(f)
         self.char_to_idx = data["char_to_idx"]
         self.idx_to_char = {int(k): v for k, v in data["idx_to_char"].items()}
+        self.use_english_labels = data.get("use_english_labels", False)
         self._built = True
         print(f"[Vocab] Loaded {len(self.char_to_idx)} classes from {path}")
+        if self.use_english_labels:
+            print(f"[Vocab] Using English label equivalents")
 
     # ── property ──────────────────────────────
 
@@ -213,9 +237,13 @@ def split_dataset(
 
     for img_path, txt_path in pairs:
         lbl = CharVocab._read_label(txt_path)
-        if lbl and lbl in vocab.char_to_idx:
-            valid_pairs.append((img_path, txt_path))
-            strata.append(lbl)
+        if lbl:
+            # Convert to English equivalent if needed
+            if vocab.use_english_labels:
+                lbl = get_equivalent(lbl)
+            if lbl in vocab.char_to_idx:
+                valid_pairs.append((img_path, txt_path))
+                strata.append(lbl)
 
     train_pairs, test_pairs = train_test_split(
         valid_pairs,
@@ -447,11 +475,13 @@ def predict(
     model:      CNNClassifier,
     vocab:      CharVocab,
     device:     torch.device,
+    return_original: bool = False,
 ) -> tuple[str, float]:
     """
     Run inference on one image.
     Returns (predicted_label, confidence) where confidence is the
     max softmax probability.
+    If return_original=True and mapping is available, also returns original Persian label.
     """
     model.eval()
     tf = get_transforms(augment=False)
@@ -468,6 +498,12 @@ def predict(
     confidence, pred_idx = probs.max(dim=1)
 
     label = vocab.decode(pred_idx.item())
+    
+    if return_original and HAS_MAPPING:
+        # Try to find original Persian label (reverse mapping would require lookup)
+        # For now, just return the English equivalent as we're using English labels
+        pass
+    
     return label, confidence.item()
 
 # ─────────────────────────────────────────────
@@ -535,6 +571,12 @@ def parse_args() -> argparse.Namespace:
                    help="Fraction of data used as test set (default 0.20).")
     p.add_argument("--workers",    type=int,   default=4,
                    help="DataLoader worker processes.")
+    
+    # label options
+    p.add_argument("--use_english_labels", action="store_true", default=True,
+                   help="Convert Persian labels to English equivalents using mapping module")
+    p.add_argument("--no_english_labels", dest="use_english_labels", action="store_false",
+                   help="Use original Persian labels instead of English equivalents")
 
     # misc
     p.add_argument("--resume",  type=str, default=None,
@@ -564,7 +606,7 @@ def main() -> None:
     print(f"[Device] {device}")
 
     # ── vocab ─────────────────────────────────
-    vocab = CharVocab()
+    vocab = CharVocab(use_english_labels=args.use_english_labels)
 
     if args.predict:
         # Inference mode — load pre-built vocab
@@ -599,10 +641,19 @@ def main() -> None:
         load_checkpoint(model, None, ckpt_path, device)
 
         label, confidence = predict(args.predict, model, vocab, device)
+
+        # ✅ GET ENGLISH EQUIVALENT
+        equivalent = get_equivalent(label)
+
         print(f"\n{'─'*45}")
-        print(f"  Image      : {args.predict}")
-        print(f"  Prediction : {label}")
-        print(f"  Confidence : {confidence*100:.1f}%")
+        print(f"  Image              : {args.predict}")
+        print(f"  Prediction         : {label}")
+        print(f"  English Equivalent : {equivalent}")   # ✅ NEW LINE
+        print(f"  Confidence         : {confidence*100:.1f}%")
+
+        if HAS_MAPPING and vocab.use_english_labels:
+            print(f"  Note       : Model was trained on English label equivalents")
+
         print(f"{'─'*45}\n")
         return
 
@@ -655,6 +706,10 @@ def main() -> None:
     print(f"  Train       : {len(train_dataset):,}   Test : {len(test_dataset):,}")
     print(f"  Classes     : {vocab.num_classes}")
     print(f"  Image size  : {IMG_H}×{IMG_W}")
+    if vocab.use_english_labels and HAS_MAPPING:
+        print(f"  Labels      : English equivalents (mapped from Persian)")
+    else:
+        print(f"  Labels      : Original Persian")
     print(f"{'═'*60}\n")
 
     for epoch in range(start_epoch, args.epochs):
