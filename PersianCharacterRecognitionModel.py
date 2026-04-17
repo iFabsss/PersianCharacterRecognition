@@ -1,22 +1,28 @@
 """
 Persian Alphabet Character Recognition
-CNN Classifier — PyTorch
+CNN Classifier -- PyTorch
 
-Dataset format:
-  {num}{character}.jpg   e.g. 1alef.jpg
-  {num}{character}.txt   e.g. 1alef.txt  (contains "Alef")
-
-Supported layouts:
-  flat  : data_dir/{num}{char}.jpg + data_dir/{num}{char}.txt
-  split : data_dir/images/*.jpg    + data_dir/labels/*.txt
+Dataset layout:
+  dataset/
+    images/
+      1alef.jpg
+      aleph_1.png
+    labels/
+      1alef.txt           (contains a raw Persian character)
+      aleph_1.txt         (contains a raw Persian character)
+    Persian Characters List.txt   <- one Persian character per line, 68 total
 
 Usage:
-  # Train
-  PersianCharacterRecognitionModel.py --data_dir ./dataset_copy --epochs 30 --batch_size 32
+  # Train (char list auto-resolved to <data_dir>/Persian Characters List.txt)
+  python PersianCharacterRecognitionModel.py --data_dir ./dataset --epochs 30
+
+  # Train with an explicit char list path
+  python PersianCharacterRecognitionModel.py --data_dir ./dataset \\
+      --char_list "./dataset/Persian Characters List.txt" --epochs 30
 
   # Predict
-  PersianCharacterRecognitionModel.py --predict path/to/image.jpg \
-                    --output_dir ./output
+  python PersianCharacterRecognitionModel.py --predict path/to/image.jpg \\
+      --output_dir ./output
 """
 
 import os
@@ -24,11 +30,14 @@ import json
 import time
 import random
 import argparse
+import cv2
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 from sklearn.model_selection import train_test_split
+
+from PIL import ImageFilter
 
 import torch
 import torch.nn as nn
@@ -37,19 +46,19 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torch.amp import autocast, GradScaler
 
-# Import Persian to English mapping
+# Import Persian-to-English mapping (used only for display at prediction time)
 try:
-    from PersianCharacterEnglishAlphabet import get_equivalent
+    from PersianCharacterEnglishAlphabet import get_equivalent, get_symbol, get_ambiguous_hint
     HAS_MAPPING = True
 except ImportError:
     print("[Warning] PersianCharacterEnglishAlphabet module not found. "
-          "Will use original Persian labels only.")
+          "English equivalents will not be shown in predictions.")
     HAS_MAPPING = False
-    def get_equivalent(x): return x  # fallback identity function
+    def get_equivalent(x): return x  # fallback: identity
 
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 1. REPRODUCIBILITY
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 SEED = 42
 
@@ -62,90 +71,117 @@ def set_seed(seed: int) -> None:
 
 set_seed(SEED)
 
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 2. CHARACTER VOCABULARY
-#    Built dynamically from .txt label files.
-#    No static Persian↔English map — everything
-#    is derived from the actual dataset_copy labels.
-# ─────────────────────────────────────────────
+#
+#    Built from "Persian Characters List.txt" -- NOT inferred from label files.
+#    This guarantees exactly 68 classes regardless of which datasets are mixed.
+#
+#    Why not get_equivalent() here?
+#      Two datasets each cover 34 distinct Persian characters.  When both are
+#      mapped to English, they produce the SAME 34 English names, making the
+#      model see only 34 classes instead of 68.  Using raw Persian Unicode as
+#      the class identifier avoids that collision entirely.
+# -----------------------------------------------------------------------------
 
 class CharVocab:
     """
-    Scans all label (.txt) files and builds a class index mapping.
+    Fixed-vocabulary class list loaded from a canonical text file.
 
     Index layout:
-      0, 1, 2, ...  →  real character classes (no reserved blank)
+      0, 1, 2, ...  ->  Persian characters in file order (not sorted).
 
-    Labels are normalised (stripped + title-cased) so minor
-    capitalisation differences don't create duplicate classes.
+    Label .txt files must contain exactly one of the listed characters
+    (raw Unicode, stripped of surrounding whitespace).
     """
 
-    def __init__(self, use_english_labels: bool = True) -> None:
+    def __init__(self) -> None:
         self.char_to_idx: dict[str, int] = {}
         self.idx_to_char: dict[int, str] = {}
-        self.use_english_labels = use_english_labels and HAS_MAPPING
         self._built = False
 
-    # ── building ──────────────────────────────
+    # -- building --------------------------------------------------------------
 
-    def build_from_label_files(self, label_paths: list[str]) -> None:
-        unique_chars: set[str] = set()
-        for path in label_paths:
-            label = self._read_label(path)
-            if label:
-                # Convert to English equivalent if requested
-                if self.use_english_labels:
-                    label = get_equivalent(label)
-                unique_chars.add(label)
+    def build_from_character_list(self, list_path: str) -> None:
+        """
+        Read the canonical Persian Characters List and register every
+        non-blank line as a class, preserving file order.
 
-        if not unique_chars:
-            raise RuntimeError("[Vocab] No valid labels found. Check your .txt files.")
+        Parameters
+        ----------
+        list_path : str
+            Path to "Persian Characters List.txt".
+            Each line must contain exactly one Persian character.
+        """
+        list_path = Path(list_path)
+        if not list_path.exists():
+            raise FileNotFoundError(
+                f"[Vocab] Character list not found: {list_path}\n"
+                f"        Pass --char_list <path> or place the file at the "
+                f"default location (<data_dir>/Persian Characters List.txt)."
+            )
 
-        for i, ch in enumerate(sorted(unique_chars)):   # deterministic order
+        chars: list[str] = []
+        seen:  set[str]  = set()
+
+        with open(list_path, "r", encoding="utf-8") as f:
+            for lineno, raw in enumerate(f, 1):
+                ch = raw.strip()
+                if not ch:
+                    continue                     # skip blank lines
+                if ch in seen:
+                    print(f"[Vocab] Warning: duplicate '{ch}' on line {lineno} -- skipped.")
+                    continue
+                chars.append(ch)
+                seen.add(ch)
+
+        if not chars:
+            raise RuntimeError(
+                f"[Vocab] No characters found in {list_path}. "
+                "Is the file empty or using an unexpected encoding?"
+            )
+
+        for i, ch in enumerate(chars):          # order from file, not sorted()
             self.char_to_idx[ch] = i
             self.idx_to_char[i]  = ch
 
         self._built = True
-        print(f"[Vocab] {len(self.char_to_idx)} classes: {sorted(self.char_to_idx)}")
-        if self.use_english_labels:
-            print(f"[Vocab] Using English label equivalents for classification")
+        print(f"[Vocab] {len(self.char_to_idx)} classes loaded from {list_path}")
+        print(f"[Vocab] Characters: {list(self.char_to_idx.keys())}")
 
-    # ── I/O helpers ───────────────────────────
+    # -- I/O helpers -----------------------------------------------------------
 
     @staticmethod
-    def _read_label(txt_path: str) -> str | None:
+    def _read_label(txt_path: str) -> "str | None":
+        """Read a label .txt and return the raw Persian character (stripped)."""
         try:
             with open(txt_path, "r", encoding="utf-8") as f:
-                return f.read().strip().title()
+                return f.read().strip()          # do NOT title-case Persian text
         except Exception as e:
             print(f"[Vocab] Warning: could not read {txt_path}: {e}")
             return None
 
     def encode(self, label: str) -> int:
-        """Return the integer class index for a label string."""
-        label = label.strip().title()
-        # Convert to English equivalent if requested
-        if self.use_english_labels:
-            label = get_equivalent(label)
-        
+        """Return the integer class index for a raw Persian character string."""
+        label = label.strip()                    # no case-folding for Persian
         if label not in self.char_to_idx:
             raise ValueError(
                 f"[Vocab] Unknown label '{label}'. "
-                f"Known: {sorted(self.char_to_idx)}"
+                f"It is not in the Persian Characters List.\n"
+                f"        Known chars: {list(self.char_to_idx.keys())}"
             )
         return self.char_to_idx[label]
 
     def decode(self, idx: int) -> str:
-        """Return the label string for a class index."""
+        """Return the Persian character for a class index."""
         return self.idx_to_char.get(idx, "<unknown>")
 
-    # ── persistence ───────────────────────────
+    # -- persistence -----------------------------------------------------------
 
     def save(self, path: str) -> None:
         payload = {
             "char_to_idx": self.char_to_idx,
             "idx_to_char": self.idx_to_char,
-            "use_english_labels": self.use_english_labels,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -156,72 +192,137 @@ class CharVocab:
             data = json.load(f)
         self.char_to_idx = data["char_to_idx"]
         self.idx_to_char = {int(k): v for k, v in data["idx_to_char"].items()}
-        self.use_english_labels = data.get("use_english_labels", False)
         self._built = True
         print(f"[Vocab] Loaded {len(self.char_to_idx)} classes from {path}")
-        if self.use_english_labels:
-            print(f"[Vocab] Using English label equivalents")
 
-    # ── property ──────────────────────────────
+    # -- property --------------------------------------------------------------
 
     @property
     def num_classes(self) -> int:
         return len(self.char_to_idx)
 
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 3. DATASET DISCOVERY
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
-def discover_pairs(data_dir: str) -> list[tuple[str, str]]:
+def _resolve_subdirs(data_dir: Path) -> tuple[Path, Path]:
     """
-    Walk data_dir for image files and locate their matching .txt label.
+    Locate the images/ and labels/ subdirectories under data_dir.
 
-    Search order per image:
-      1. Same directory as the image  ({stem}.txt)
-      2. Sister  labels/  subdirectory
+    Layout A (preferred):
+        data_dir/
+            images/   <- image files
+            labels/   <- matching .txt files
+
+    Layout B (flat fallback):
+        data_dir/
+            1alef.jpg + 1alef.txt  (same folder)
+
+    Returns (images_dir, labels_dir).
+    """
+    images_dir = data_dir / "images"
+    labels_dir = data_dir / "labels"
+
+    if images_dir.is_dir() and labels_dir.is_dir():
+        print(f"[Dataset] images -> {images_dir}")
+        print(f"[Dataset] labels -> {labels_dir}")
+        return images_dir, labels_dir
+
+    print(
+        f"[Dataset] Warning: could not find both 'images/' and 'labels/' "
+        f"under {data_dir}.\n"
+        f"          Falling back to flat layout -- searching {data_dir} for "
+        f"image+label pairs in the same directory."
+    )
+    return data_dir, data_dir
+
+
+def discover_pairs(
+    data_dir: str,
+    vocab: "CharVocab | None" = None,
+) -> list[tuple[str, str]]:
+    """
+    Walk images/ for image files and match each to its .txt label in labels/.
+
+    Matching is purely by filename stem (no extension):
+        images/1alef.jpg   ->  labels/1alef.txt
+        images/aleph_1.png ->  labels/aleph_1.txt
+
+    If `vocab` is supplied, any label whose content is NOT in the
+    vocab's character list is skipped with a warning.  This is what
+    prevents mismatched cross-dataset labels from silently corrupting
+    the class indices.
 
     Returns a list of (image_path, label_path) tuples.
     """
-    data_dir = Path(data_dir)
+    data_dir   = Path(data_dir)
+    images_dir, labels_dir = _resolve_subdirs(data_dir)
 
-    img_files: list[Path] = (
-        list(data_dir.rglob("*.jpg"))
-        + list(data_dir.rglob("*.jpeg"))
-        + list(data_dir.rglob("*.png"))
+    img_files: list[Path] = sorted(
+        list(images_dir.rglob("*.jpg"))
+        + list(images_dir.rglob("*.jpeg"))
+        + list(images_dir.rglob("*.png"))
     )
 
     if not img_files:
-        raise FileNotFoundError(f"[Dataset] No image files found under {data_dir}")
+        raise FileNotFoundError(
+            f"[Dataset] No image files found under {images_dir}"
+        )
 
-    pairs:   list[tuple[str, str]] = []
-    missing: int = 0
+    pairs:        list[tuple[str, str]] = []
+    missing:      int = 0
+    out_of_vocab: int = 0
 
-    for img_path in sorted(img_files):
-        # 1. Same directory
-        txt_path = img_path.with_suffix(".txt")
+    for img_path in img_files:
+        try:
+            relative_stem = img_path.relative_to(images_dir).with_suffix("")
+        except ValueError:
+            relative_stem = Path(img_path.stem)
+
+        txt_path = (labels_dir / relative_stem).with_suffix(".txt")
+
         if not txt_path.exists():
-            # 2. Sister labels/ directory
-            alt = data_dir / "labels" / (img_path.stem + ".txt")
-            if alt.exists():
-                txt_path = alt
-            else:
-                missing += 1
+            missing += 1
+            if missing <= 10:
+                print(f"[Dataset] No label for {img_path.name} (expected {txt_path})")
+            continue
+
+        if vocab is not None:
+            raw_label = CharVocab._read_label(str(txt_path))
+            if raw_label is None or raw_label not in vocab.char_to_idx:
+                out_of_vocab += 1
+                if out_of_vocab <= 10:
+                    print(f"[Dataset] Skipping {img_path.name}: "
+                          f"label '{raw_label}' not in Persian Characters List.")
                 continue
+
         pairs.append((str(img_path), str(txt_path)))
+
+    if missing > 10:
+        print(f"[Dataset] ... and {missing - 10} more image(s) without labels.")
+    if out_of_vocab > 10:
+        print(f"[Dataset] ... and {out_of_vocab - 10} more with out-of-vocab labels.")
 
     print(
         f"[Dataset] {len(pairs)} valid pairs found "
-        f"({missing} image(s) skipped — no matching .txt)."
+        f"({missing} skipped - no .txt | {out_of_vocab} skipped - not in char list)."
     )
+
     if not pairs:
         raise RuntimeError(
-            "[Dataset] No image–label pairs found. Check your data_dir layout."
+            "[Dataset] No image-label pairs found.\n"
+            "  Expected layout:\n"
+            "    <data_dir>/images/<n>.jpg  (or .jpeg / .png)\n"
+            "    <data_dir>/labels/<n>.txt  (raw Persian character inside)\n"
+            "  Label .txt files must contain one of the 68 Persian characters\n"
+            "  listed in 'Persian Characters List.txt'.\n"
+            "  Make sure filenames (without extension) match exactly."
         )
     return pairs
 
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 4. TRAIN / TEST SPLIT  (stratified)
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def split_dataset(
     pairs: list[tuple[str, str]],
@@ -236,14 +337,10 @@ def split_dataset(
     strata:      list[str]             = []
 
     for img_path, txt_path in pairs:
-        lbl = CharVocab._read_label(txt_path)
-        if lbl:
-            # Convert to English equivalent if needed
-            if vocab.use_english_labels:
-                lbl = get_equivalent(lbl)
-            if lbl in vocab.char_to_idx:
-                valid_pairs.append((img_path, txt_path))
-                strata.append(lbl)
+        lbl = CharVocab._read_label(txt_path)   # raw Persian character
+        if lbl and lbl in vocab.char_to_idx:
+            valid_pairs.append((img_path, txt_path))
+            strata.append(lbl)
 
     train_pairs, test_pairs = train_test_split(
         valid_pairs,
@@ -255,12 +352,12 @@ def split_dataset(
     print(f"[Split] Train: {len(train_pairs)} | Test: {len(test_pairs)}")
     return train_pairs, test_pairs
 
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 5. TRANSFORMS
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
-IMG_H = 64    # height fed to the CNN
-IMG_W = 64    # width  fed to the CNN  (square crop suits single characters)
+IMG_H = 128    # height fed to the CNN
+IMG_W = 128    # width  fed to the CNN
 
 def get_transforms(augment: bool = False) -> transforms.Compose:
     ops = [
@@ -277,9 +374,6 @@ def get_transforms(augment: bool = False) -> transforms.Compose:
                 scale=(0.90, 1.10),
                 fill=255,
             ),
-            transforms.RandomPerspective(distortion_scale=0.15, p=0.4),
-            transforms.ColorJitter(brightness=0.3, contrast=0.3),
-            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
         ]
 
     ops += [
@@ -289,9 +383,9 @@ def get_transforms(augment: bool = False) -> transforms.Compose:
 
     return transforms.Compose(ops)
 
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 6. DATASET
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 class PersianCharDataset(Dataset):
     def __init__(
@@ -310,33 +404,24 @@ class PersianCharDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int, str]:
         img_path, txt_path = self.pairs[idx]
 
-        # ── load image ────────────────────────
         try:
             image = Image.open(img_path).convert("L")
         except Exception as e:
             print(f"[Dataset] Cannot open {img_path}: {e}. Using blank fallback.")
-            image = Image.new("RGB", (IMG_W, IMG_H), color=255)
+            image = Image.new("L", (IMG_W, IMG_H), color=255)
 
         image = self.transform(image)   # Tensor (1, H, W)
 
-        # ── load label ────────────────────────
         label_str = CharVocab._read_label(txt_path)
         label_idx = self.vocab.encode(label_str)
 
         return image, label_idx, label_str
 
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 7. CNN MODEL
-#    Four convolutional blocks + Global Average
-#    Pooling + fully-connected head.
-#    Designed for single-character images.
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
-def _conv_block(
-    in_ch:  int,
-    out_ch: int,
-    pool:   bool = True,
-) -> nn.Sequential:
+def _conv_block(in_ch: int, out_ch: int, pool: bool = True) -> nn.Sequential:
     layers: list[nn.Module] = [
         nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
         nn.BatchNorm2d(out_ch),
@@ -346,30 +431,28 @@ def _conv_block(
         nn.ReLU(inplace=True),
     ]
     if pool:
-        layers.append(nn.MaxPool2d(2, 2))   # halves spatial dims
+        layers.append(nn.MaxPool2d(2, 2))
     return nn.Sequential(*layers)
 
 
 class CNNClassifier(nn.Module):
     """
     Input  : (B, 1, IMG_H, IMG_W)
-    Output : (B, num_classes)  — raw logits for CrossEntropyLoss
+    Output : (B, num_classes)  -- raw logits for CrossEntropyLoss
     """
 
     def __init__(self, num_classes: int, dropout: float = 0.4) -> None:
         super().__init__()
 
-        # ── feature extractor ─────────────────
-        # 64×64 → 32×32 → 16×16 → 8×8 → 4×4 → GAP
+        # 64x64 -> 32x32 -> 16x16 -> 8x8 -> 4x4 -> GAP
         self.features = nn.Sequential(
-            _conv_block(  1,  64, pool=True),   # 64 → 32
-            _conv_block( 64, 128, pool=True),   # 32 → 16
-            _conv_block(128, 256, pool=True),   # 16 →  8
-            _conv_block(256, 512, pool=True),   #  8 →  4
-            nn.AdaptiveAvgPool2d((1, 1)),        # 4  →  1×1
+            _conv_block(  1,  64, pool=True),
+            _conv_block( 64, 128, pool=True),
+            _conv_block(128, 256, pool=True),
+            _conv_block(256, 512, pool=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
         )
 
-        # ── classifier head ───────────────────
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Linear(512, 512),
@@ -397,13 +480,11 @@ class CNNClassifier(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
-        x = self.classifier(x)
-        return x   # raw logits
+        return self.classifier(self.features(x))
 
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 8. TRAINING & EVALUATION
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def train_one_epoch(
     model:     CNNClassifier,
@@ -423,7 +504,7 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(device_type=device.type, enabled=False):
-            logits = model(images)          # (B, num_classes)
+            logits = model(images)
             loss   = criterion(logits, labels)
 
         scaler.scale(loss).backward()
@@ -465,50 +546,95 @@ def evaluate(
     accuracy = correct / total if total > 0 else 0.0
     return avg_loss, accuracy
 
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 9. INFERENCE  (single image)
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+
 
 @torch.no_grad()
-def predict(
-    image_path: str,
-    model:      CNNClassifier,
-    vocab:      CharVocab,
-    device:     torch.device,
-    return_original: bool = False,
-) -> tuple[str, float]:
-    """
-    Run inference on one image.
-    Returns (predicted_label, confidence) where confidence is the
-    max softmax probability.
-    If return_original=True and mapping is available, also returns original Persian label.
-    """
+def predict(image_path, model, vocab, device, tta_runs: int = 7):
     model.eval()
-    tf = get_transforms(augment=False)
+    tf_base = get_transforms(augment=False)
 
+    # Small TTA augmentation — subtle enough not to distort,
+    # varied enough to produce meaningful spread across runs
+    tf_tta = transforms.Compose([
+        transforms.RandomRotation(degrees=8, fill=255),
+        transforms.RandomAffine(
+            degrees=0,
+            translate=(0.05, 0.05),
+            scale=(0.93, 1.07),
+            fill=255,
+        ),
+    ])
+
+    # --- Load & binarize ---
     try:
         img = Image.open(image_path).convert("L")
     except Exception as e:
         raise RuntimeError(f"[Predict] Cannot open image {image_path}: {e}")
 
-    img_tensor = tf(img).unsqueeze(0).to(device)   # (1, 1, H, W)
+    img_cv = np.array(img)
+    _, binary = cv2.threshold(img_cv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    logits     = model(img_tensor)                  # (1, num_classes)
-    probs      = torch.softmax(logits, dim=1)       # (1, num_classes)
-    confidence, pred_idx = probs.max(dim=1)
+    if np.mean(binary) < 128:
+        binary = 255 - binary
 
-    label = vocab.decode(pred_idx.item())
-    
-    if return_original and HAS_MAPPING:
-        # Try to find original Persian label (reverse mapping would require lookup)
-        # For now, just return the English equivalent as we're using English labels
-        pass
-    
-    return label, confidence.item()
+    img = Image.fromarray(binary)
 
-# ─────────────────────────────────────────────
+    bbox = img.getbbox()
+    if bbox:
+        img = img.crop(bbox)
+
+    max_dim = max(img.size)
+    padded = Image.new("L", (max_dim, max_dim), 255)
+    padded.paste(img, ((max_dim - img.size[0]) // 2,
+                       (max_dim - img.size[1]) // 2))
+
+    # --- TTA: collect raw probability vectors across runs ---
+    # Shape will be (tta_runs, num_classes)
+    all_probs = []
+
+    # Run 0: clean baseline (no augmentation)
+    base_tensor = tf_base(padded).unsqueeze(0).to(device)
+    base_probs  = torch.softmax(model(base_tensor), dim=1)  # (1, C)
+    all_probs.append(base_probs)
+
+    # Runs 1..tta_runs-1: augmented variants
+    for _ in range(tta_runs - 1):
+        aug_img    = tf_tta(padded)                              # PIL → PIL
+        aug_tensor = tf_base(aug_img).unsqueeze(0).to(device)   # normalize
+        aug_probs  = torch.softmax(model(aug_tensor), dim=1)    # (1, C)
+        all_probs.append(aug_probs)
+
+    # Stack → (tta_runs, num_classes)
+    all_probs = torch.cat(all_probs, dim=0)
+
+    # --- Consensus: find the modal predicted class ---
+    run_preds = all_probs.argmax(dim=1)          # (tta_runs,) — one pred per run
+    pred_counts = torch.bincount(run_preds, minlength=all_probs.shape[1])
+
+    max_count   = pred_counts.max().item()
+    modal_idxs  = (pred_counts == max_count).nonzero(as_tuple=True)[0]
+
+    if len(modal_idxs) == 1:
+        # Clear winner — use the mode
+        final_idx = modal_idxs[0].item()
+    else:
+        # Tie — fall back to mean probability across all runs
+        # This gives the class whose average confidence is highest
+        mean_probs = all_probs.mean(dim=0)           # (num_classes,)
+        # Only consider the tied classes, not all classes
+        tied_probs = mean_probs[modal_idxs]
+        final_idx  = modal_idxs[tied_probs.argmax()].item()
+
+    final_confidence = all_probs[:, final_idx].mean().item()
+    label = vocab.decode(final_idx)
+    return label, final_confidence
+
+# -----------------------------------------------------------------------------
 # 10. CHECKPOINT HELPERS
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def save_checkpoint(
     model:     CNNClassifier,
@@ -526,12 +652,12 @@ def save_checkpoint(
         },
         path,
     )
-    print(f"[Checkpoint] Saved → {path}")
+    print(f"[Checkpoint] Saved -> {path}")
 
 
 def load_checkpoint(
     model:     CNNClassifier,
-    optimizer: optim.Optimizer | None,
+    optimizer: "optim.Optimizer | None",
     path:      str,
     device:    torch.device,
 ) -> tuple[int, float]:
@@ -544,18 +670,31 @@ def load_checkpoint(
     print(f"[Checkpoint] Loaded epoch {epoch} (best_acc={best_acc:.4f}) from {path}")
     return epoch, best_acc
 
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 11. ARGUMENT PARSER
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Persian Character Recognition — CNN Classifier"
+        description="Persian Character Recognition -- CNN Classifier"
     )
 
     # paths
-    p.add_argument("--data_dir",   type=str, default="./dataset_copy",
-                   help="Root directory containing image+label pairs.")
+    p.add_argument("--data_dir",   type=str, default="./dataset",
+                   help=(
+                       "Root directory.  Expected layout:\n"
+                       "  <data_dir>/images/<n>.jpg  (or .jpeg / .png)\n"
+                       "  <data_dir>/labels/<n>.txt  (raw Persian char inside)\n"
+                       "  <data_dir>/Persian Characters List.txt\n"
+                       "A flat layout (images and labels in the same folder) is also "
+                       "accepted as a fallback."
+                   ))
+    p.add_argument("--char_list",  type=str, default=None,
+                   help=(
+                       "Path to the Persian Characters List .txt file "
+                       "(one Persian character per line, 68 total). "
+                       "Defaults to <data_dir>/Persian Characters List.txt."
+                   ))
     p.add_argument("--output_dir", type=str, default="./output",
                    help="Where to save checkpoints, vocab JSON, and training log.")
     p.add_argument("--vocab_path", type=str, default=None,
@@ -571,12 +710,6 @@ def parse_args() -> argparse.Namespace:
                    help="Fraction of data used as test set (default 0.20).")
     p.add_argument("--workers",    type=int,   default=4,
                    help="DataLoader worker processes.")
-    
-    # label options
-    p.add_argument("--use_english_labels", action="store_true", default=True,
-                   help="Convert Persian labels to English equivalents using mapping module")
-    p.add_argument("--no_english_labels", dest="use_english_labels", action="store_false",
-                   help="Use original Persian labels instead of English equivalents")
 
     # misc
     p.add_argument("--resume",  type=str, default=None,
@@ -586,9 +719,9 @@ def parse_args() -> argparse.Namespace:
 
     return p.parse_args()
 
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # 12. MAIN
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def main() -> None:
 
@@ -602,14 +735,19 @@ def main() -> None:
     last_ckpt_path  = str(output_dir / "last_model.pth")
     log_path        = output_dir / "training_log.csv"
 
+    # Resolve character list path
+    char_list_path = args.char_list or str(
+        Path(args.data_dir) / "Persian Characters List.txt"
+    )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Device] {device}")
 
-    # ── vocab ─────────────────────────────────
-    vocab = CharVocab(use_english_labels=args.use_english_labels)
+    # -- vocab -----------------------------------------------------------------
+    vocab = CharVocab()
 
     if args.predict:
-        # Inference mode — load pre-built vocab
+        # Inference mode -- load pre-built vocab
         if not os.path.exists(vocab_save_path):
             raise FileNotFoundError(
                 f"[Vocab] No vocab file at '{vocab_save_path}'. "
@@ -617,12 +755,11 @@ def main() -> None:
             )
         vocab.load(vocab_save_path)
     else:
-        # Training mode — discover dataset_copy + build vocab from scratch
-        all_pairs = discover_pairs(args.data_dir)
-        vocab.build_from_label_files([p[1] for p in all_pairs])
+        # Training mode -- build vocab from the canonical character list
+        vocab.build_from_character_list(char_list_path)
         vocab.save(vocab_save_path)
 
-    # ── model ─────────────────────────────────
+    # -- model -----------------------------------------------------------------
     model = CNNClassifier(
         num_classes=vocab.num_classes,
         dropout=args.dropout,
@@ -631,7 +768,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[Model] Trainable parameters: {n_params:,}")
 
-    # ── inference only ────────────────────────
+    # -- inference only --------------------------------------------------------
     if args.predict:
         ckpt_path = args.resume or best_ckpt_path
         if not os.path.exists(ckpt_path):
@@ -640,24 +777,31 @@ def main() -> None:
             )
         load_checkpoint(model, None, ckpt_path, device)
 
-        label, confidence = predict(args.predict, model, vocab, device)
+        persian_char, confidence = predict(args.predict, model, vocab, device)
 
-        # ✅ GET ENGLISH EQUIVALENT
-        equivalent = get_equivalent(label)
+        if HAS_MAPPING:
+            english_equiv = get_equivalent(persian_char)
+            persian_symbol = get_symbol(persian_char)
+            ambiguous_hint = get_ambiguous_hint(persian_char)
+        else:
+            english_equiv = "N/A"
+            persian_symbol = "N/A"
+            ambiguous_hint = None
 
-        print(f"\n{'─'*45}")
-        print(f"  Image              : {args.predict}")
-        print(f"  Prediction         : {label}")
-        print(f"  English Equivalent : {equivalent}")   # ✅ NEW LINE
-        print(f"  Confidence         : {confidence*100:.1f}%")
-
-        if HAS_MAPPING and vocab.use_english_labels:
-            print(f"  Note       : Model was trained on English label equivalents")
-
-        print(f"{'─'*45}\n")
+        print(f"\n{'-' * 45}")
+        print(f"  Image               : {args.predict}")
+        print(f"  Prediction (Persian): {persian_char}  {persian_symbol}")
+        print(f"  English Equivalent  : {english_equiv}")
+        print(f"  Confidence          : {confidence * 100:.1f}%")
+        if ambiguous_hint:
+            print(f"  Note                : {ambiguous_hint}")
+        print(f"{'-' * 45}\n")
         return
 
-    # ── training ──────────────────────────────
+    # -- training --------------------------------------------------------------
+    # discover_pairs validates each label against the vocab, skipping unknowns
+    all_pairs = discover_pairs(args.data_dir, vocab=vocab)
+
     train_pairs, test_pairs = split_dataset(
         all_pairs, vocab, test_size=args.test_size
     )
@@ -682,7 +826,7 @@ def main() -> None:
         persistent_workers=args.workers > 0,
     )
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-6
@@ -698,19 +842,16 @@ def main() -> None:
         )
         start_epoch += 1
 
-    # ── training loop ─────────────────────────
+    # -- training loop ---------------------------------------------------------
     log_lines = ["epoch,train_loss,test_loss,test_acc,lr,elapsed_s"]
 
-    print(f"\n{'═'*60}")
+    print(f"\n{'='*60}")
     print(f"  Epochs      : {args.epochs}   Batch : {args.batch_size}   LR : {args.lr}")
     print(f"  Train       : {len(train_dataset):,}   Test : {len(test_dataset):,}")
     print(f"  Classes     : {vocab.num_classes}")
-    print(f"  Image size  : {IMG_H}×{IMG_W}")
-    if vocab.use_english_labels and HAS_MAPPING:
-        print(f"  Labels      : English equivalents (mapped from Persian)")
-    else:
-        print(f"  Labels      : Original Persian")
-    print(f"{'═'*60}\n")
+    print(f"  Image size  : {IMG_H}x{IMG_W}")
+    print(f"  Char list   : {char_list_path}")
+    print(f"{'='*60}\n")
 
     for epoch in range(start_epoch, args.epochs):
         t0         = time.time()
@@ -743,18 +884,18 @@ def main() -> None:
         if test_acc > best_acc:
             best_acc = test_acc
             save_checkpoint(model, optimizer, epoch, best_acc, best_ckpt_path)
-            print(f"  ★ New best accuracy: {best_acc*100:.2f}%")
+            print(f"  * New best accuracy: {best_acc*100:.2f}%")
 
     with open(log_path, "w") as f:
         f.write("\n".join(log_lines))
 
-    print(f"\n{'═'*60}")
+    print(f"\n{'='*60}")
     print(f"  Training complete.")
     print(f"  Best test accuracy : {best_acc*100:.2f}%")
     print(f"  Best model         : {best_ckpt_path}")
     print(f"  Vocab              : {vocab_save_path}")
     print(f"  Training log       : {log_path}")
-    print(f"{'═'*60}\n")
+    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
