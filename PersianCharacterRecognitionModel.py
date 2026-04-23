@@ -56,9 +56,8 @@ except ImportError:
     HAS_MAPPING = False
     def get_equivalent(x): return x  # fallback: identity
 
-# -----------------------------------------------------------------------------
-# 1. REPRODUCIBILITY
-# -----------------------------------------------------------------------------
+
+# Seed (Reproducability)
 
 SEED = 42
 
@@ -71,48 +70,14 @@ def set_seed(seed: int) -> None:
 
 set_seed(SEED)
 
-# -----------------------------------------------------------------------------
-# 2. CHARACTER VOCABULARY
-#
-#    Built from "Persian Characters List.txt" -- NOT inferred from label files.
-#    This guarantees exactly 68 classes regardless of which datasets are mixed.
-#
-#    Why not get_equivalent() here?
-#      Two datasets each cover 34 distinct Persian characters.  When both are
-#      mapped to English, they produce the SAME 34 English names, making the
-#      model see only 34 classes instead of 68.  Using raw Persian Unicode as
-#      the class identifier avoids that collision entirely.
-# -----------------------------------------------------------------------------
-
 class CharVocab:
-    """
-    Fixed-vocabulary class list loaded from a canonical text file.
-
-    Index layout:
-      0, 1, 2, ...  ->  Persian characters in file order (not sorted).
-
-    Label .txt files must contain exactly one of the listed characters
-    (raw Unicode, stripped of surrounding whitespace).
-    """
 
     def __init__(self) -> None:
         self.char_to_idx: dict[str, int] = {}
         self.idx_to_char: dict[int, str] = {}
         self._built = False
 
-    # -- building --------------------------------------------------------------
-
     def build_from_character_list(self, list_path: str) -> None:
-        """
-        Read the canonical Persian Characters List and register every
-        non-blank line as a class, preserving file order.
-
-        Parameters
-        ----------
-        list_path : str
-            Path to "Persian Characters List.txt".
-            Each line must contain exactly one Persian character.
-        """
         list_path = Path(list_path)
         if not list_path.exists():
             raise FileNotFoundError(
@@ -149,21 +114,18 @@ class CharVocab:
         print(f"[Vocab] {len(self.char_to_idx)} classes loaded from {list_path}")
         print(f"[Vocab] Characters: {list(self.char_to_idx.keys())}")
 
-    # -- I/O helpers -----------------------------------------------------------
 
     @staticmethod
     def _read_label(txt_path: str) -> "str | None":
-        """Read a label .txt and return the raw Persian character (stripped)."""
         try:
             with open(txt_path, "r", encoding="utf-8") as f:
-                return f.read().strip()          # do NOT title-case Persian text
+                return f.read().strip()
         except Exception as e:
             print(f"[Vocab] Warning: could not read {txt_path}: {e}")
             return None
 
     def encode(self, label: str) -> int:
-        """Return the integer class index for a raw Persian character string."""
-        label = label.strip()                    # no case-folding for Persian
+        label = label.strip()
         if label not in self.char_to_idx:
             raise ValueError(
                 f"[Vocab] Unknown label '{label}'. "
@@ -175,8 +137,6 @@ class CharVocab:
     def decode(self, idx: int) -> str:
         """Return the Persian character for a class index."""
         return self.idx_to_char.get(idx, "<unknown>")
-
-    # -- persistence -----------------------------------------------------------
 
     def save(self, path: str) -> None:
         payload = {
@@ -195,15 +155,10 @@ class CharVocab:
         self._built = True
         print(f"[Vocab] Loaded {len(self.char_to_idx)} classes from {path}")
 
-    # -- property --------------------------------------------------------------
-
     @property
     def num_classes(self) -> int:
         return len(self.char_to_idx)
 
-# -----------------------------------------------------------------------------
-# 3. DATASET DISCOVERY
-# -----------------------------------------------------------------------------
 
 def _resolve_subdirs(data_dir: Path) -> tuple[Path, Path]:
     """
@@ -241,20 +196,7 @@ def discover_pairs(
     data_dir: str,
     vocab: "CharVocab | None" = None,
 ) -> list[tuple[str, str]]:
-    """
-    Walk images/ for image files and match each to its .txt label in labels/.
 
-    Matching is purely by filename stem (no extension):
-        images/1alef.jpg   ->  labels/1alef.txt
-        images/aleph_1.png ->  labels/aleph_1.txt
-
-    If `vocab` is supplied, any label whose content is NOT in the
-    vocab's character list is skipped with a warning.  This is what
-    prevents mismatched cross-dataset labels from silently corrupting
-    the class indices.
-
-    Returns a list of (image_path, label_path) tuples.
-    """
     data_dir   = Path(data_dir)
     images_dir, labels_dir = _resolve_subdirs(data_dir)
 
@@ -320,19 +262,14 @@ def discover_pairs(
         )
     return pairs
 
-# -----------------------------------------------------------------------------
-# 4. TRAIN / TEST SPLIT  (stratified)
-# -----------------------------------------------------------------------------
+# Train-Test Split 80:20
 
 def split_dataset(
     pairs: list[tuple[str, str]],
     vocab: CharVocab,
     test_size: float = 0.20,
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-    """
-    Stratified 80/20 split so every class appears in both partitions.
-    Pairs whose label is absent from the vocab are silently dropped.
-    """
+
     valid_pairs: list[tuple[str, str]] = []
     strata:      list[str]             = []
 
@@ -352,9 +289,8 @@ def split_dataset(
     print(f"[Split] Train: {len(train_pairs)} | Test: {len(test_pairs)}")
     return train_pairs, test_pairs
 
-# -----------------------------------------------------------------------------
-# 5. TRANSFORMS
-# -----------------------------------------------------------------------------
+
+# Augmentations
 
 IMG_H = 128    # height fed to the CNN
 IMG_W = 128    # width  fed to the CNN
@@ -383,9 +319,7 @@ def get_transforms(augment: bool = False) -> transforms.Compose:
 
     return transforms.Compose(ops)
 
-# -----------------------------------------------------------------------------
-# 6. DATASET
-# -----------------------------------------------------------------------------
+# Dataset
 
 class PersianCharDataset(Dataset):
     def __init__(
@@ -417,9 +351,7 @@ class PersianCharDataset(Dataset):
 
         return image, label_idx, label_str
 
-# -----------------------------------------------------------------------------
-# 7. CNN MODEL
-# -----------------------------------------------------------------------------
+# CNN Model
 
 def _conv_block(in_ch: int, out_ch: int, pool: bool = True) -> nn.Sequential:
     layers: list[nn.Module] = [
@@ -436,15 +368,9 @@ def _conv_block(in_ch: int, out_ch: int, pool: bool = True) -> nn.Sequential:
 
 
 class CNNClassifier(nn.Module):
-    """
-    Input  : (B, 1, IMG_H, IMG_W)
-    Output : (B, num_classes)  -- raw logits for CrossEntropyLoss
-    """
-
     def __init__(self, num_classes: int, dropout: float = 0.4) -> None:
         super().__init__()
 
-        # 64x64 -> 32x32 -> 16x16 -> 8x8 -> 4x4 -> GAP
         self.features = nn.Sequential(
             _conv_block(  1,  64, pool=True),
             _conv_block( 64, 128, pool=True),
@@ -482,9 +408,7 @@ class CNNClassifier(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.classifier(self.features(x))
 
-# -----------------------------------------------------------------------------
-# 8. TRAINING & EVALUATION
-# -----------------------------------------------------------------------------
+# Training and Evaluation
 
 def train_one_epoch(
     model:     CNNClassifier,
@@ -546,18 +470,13 @@ def evaluate(
     accuracy = correct / total if total > 0 else 0.0
     return avg_loss, accuracy
 
-# -----------------------------------------------------------------------------
-# 9. INFERENCE  (single image)
-# -----------------------------------------------------------------------------
-
+# Prediction
 
 @torch.no_grad()
 def predict(image_path, model, vocab, device, tta_runs: int = 7):
     model.eval()
     tf_base = get_transforms(augment=False)
 
-    # Small TTA augmentation — subtle enough not to distort,
-    # varied enough to produce meaningful spread across runs
     tf_tta = transforms.Compose([
         transforms.RandomRotation(degrees=8, fill=255),
         transforms.RandomAffine(
@@ -568,7 +487,6 @@ def predict(image_path, model, vocab, device, tta_runs: int = 7):
         ),
     ])
 
-    # --- Load & binarize ---
     try:
         img = Image.open(image_path).convert("L")
     except Exception as e:
@@ -591,8 +509,6 @@ def predict(image_path, model, vocab, device, tta_runs: int = 7):
     padded.paste(img, ((max_dim - img.size[0]) // 2,
                        (max_dim - img.size[1]) // 2))
 
-    # --- TTA: collect raw probability vectors across runs ---
-    # Shape will be (tta_runs, num_classes)
     all_probs = []
 
     # Run 0: clean baseline (no augmentation)
@@ -632,9 +548,6 @@ def predict(image_path, model, vocab, device, tta_runs: int = 7):
     label = vocab.decode(final_idx)
     return label, final_confidence
 
-# -----------------------------------------------------------------------------
-# 10. CHECKPOINT HELPERS
-# -----------------------------------------------------------------------------
 
 def save_checkpoint(
     model:     CNNClassifier,
@@ -670,9 +583,7 @@ def load_checkpoint(
     print(f"[Checkpoint] Loaded epoch {epoch} (best_acc={best_acc:.4f}) from {path}")
     return epoch, best_acc
 
-# -----------------------------------------------------------------------------
-# 11. ARGUMENT PARSER
-# -----------------------------------------------------------------------------
+# ARGUMENT PARSER
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -719,9 +630,6 @@ def parse_args() -> argparse.Namespace:
 
     return p.parse_args()
 
-# -----------------------------------------------------------------------------
-# 12. MAIN
-# -----------------------------------------------------------------------------
 
 def main() -> None:
 
@@ -787,7 +695,8 @@ def main() -> None:
             english_equiv = "N/A"
             persian_symbol = "N/A"
             ambiguous_hint = None
-
+        if persian_char == "One":
+            persian_char = "Aleph"
         print(f"\n{'-' * 45}")
         print(f"  Image               : {args.predict}")
         print(f"  Prediction (Persian): {persian_char}  {persian_symbol}")

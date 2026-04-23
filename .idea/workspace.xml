@@ -8,13 +8,6 @@
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/PersianCharacterEnglishAlphabet.py" beforeDir="false" afterPath="$PROJECT_DIR$/PersianCharacterEnglishAlphabet.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/PersianCharacterRecognitionModel.py" beforeDir="false" afterPath="$PROJECT_DIR$/PersianCharacterRecognitionModel.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/dataset/images/70.r.jpg" beforeDir="false" afterPath="$PROJECT_DIR$/dataset/images/70r.jpg" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/dataset/labels/70.r.txt" beforeDir="false" afterPath="$PROJECT_DIR$/dataset/labels/70r.txt" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/best_model.pth" beforeDir="false" afterPath="$PROJECT_DIR$/output/best_model.pth" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/last_model.pth" beforeDir="false" afterPath="$PROJECT_DIR$/output/last_model.pth" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/training_log.csv" beforeDir="false" afterPath="$PROJECT_DIR$/output/training_log.csv" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/vocab.json" beforeDir="false" afterPath="$PROJECT_DIR$/output/vocab.json" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />

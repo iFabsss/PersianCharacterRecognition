@@ -83,10 +83,14 @@ AMBIGUOUS_GROUPS = [
 ]
 
 def get_equivalent(label: str) -> str:
+    if label == "One":
+        label = "Aleph"
     entry = PERSIAN_CHAR_MAP.get(label)
     return entry[0] if entry else "?"
 
 def get_symbol(label: str) -> str:
+    if label == "One":
+        label = "Aleph"
     entry = PERSIAN_CHAR_MAP.get(label)
     return entry[1] if entry else "?"
 
